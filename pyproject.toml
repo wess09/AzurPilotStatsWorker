@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6,<7",
     "lz4>=4.4,<5",
     "psutil>=7,<8",
+    "cryptography>=46,<52",
 ]
 
 [project.optional-dependencies]

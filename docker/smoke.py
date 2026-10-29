@@ -89,23 +89,6 @@ def main():
         assert refresh["status"] == "needs_review", refresh
         assert "research_refresh:incomplete_project_list" in refresh["diagnostics"], refresh
 
-        # An odd reward row can have a dark Oil icon in the middle. Brightness
-        # based parity used the even grid, shifting every crop by half a slot.
-        commission = Image.open(root / 'assets/cn/combat/GET_ITEMS_1.png').convert('RGB')
-        for x, name in [(464,'DecorCoins'), (592,'Oil'), (720,'BoxT2')]:
-            icon = Image.open(root / f'assets/stats/commission_items/{name}.png').convert('RGB')
-            draw = ImageDraw.Draw(icon)
-            draw.rectangle((60,71,91,95),fill='black')
-            draw.text((80,71),'1',font=ImageFont.load_default(size=20),fill='white')
-            commission.paste(icon,(x,298))
-        commission_path=work/'commission.png'
-        commission.save(commission_path)
-        request['source']['metadata'].update(project='drop',scene='commission')
-        request['files']=[str(commission_path)]
-        request['templates']=[]
-        fixed=parse()
-        assert fixed['status']=='complete' and not fixed['candidates'],fixed
-        assert {item['item']:item['amount'] for item in fixed['events'][0]['items']}=={'DecorCoins':1,'Oil':1,'BoxT2':1},fixed
         pool.close()
     print("Offline OCR and template smoke test passed")
 

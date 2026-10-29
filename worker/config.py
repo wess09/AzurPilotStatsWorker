@@ -34,8 +34,13 @@ class Config:
     auto_tune: bool = True
     work_max_bytes: int = 0
     memory_cache_bytes: int = 0
+    template_public_key: str = ""
 
     def __post_init__(self):
+        if self.template_public_key:
+            import base64
+            if len(base64.b64decode(self.template_public_key, validate=True)) != 32:
+                raise ValueError("TEMPLATE_PUBLIC_KEY must be base64 Ed25519 public key")
         if not 0 <= self.recognition_workers <= 32 or not 1 <= self.ocr_threads <= 16 or not 0 <= self.prefetch_jobs <= 32:
             raise ValueError('Invalid recognition concurrency')
         if not 0 <= self.download_workers <= 256 or not 0 <= self.verify_workers <= 32:
@@ -102,4 +107,5 @@ class Config:
             os.getenv('AUTO_TUNE', 'true').lower() in ('1', 'true', 'yes'),
             int(os.getenv('WORK_MAX_BYTES', '0')),
             int(os.getenv('MEMORY_CACHE_BYTES', '0')),
+            os.getenv('TEMPLATE_PUBLIC_KEY', ''),
         )

@@ -76,6 +76,7 @@ def retrying(operation, attempts=3):
 
 class Statistics:
     def __init__(self, config):
+        self.template_public_key = getattr(config, "template_public_key", "")
         self.client = httpx.Client(base_url=config.c_url, headers={"Authorization": "Bearer " + config.c_token}, timeout=60)
 
     def post(self, path, data):
@@ -90,11 +91,28 @@ class Statistics:
         r.raise_for_status()
         return int(r.json()["revision"])
 
-    def release(self, id_):
-        r = self.client.get(f"/internal/v1/template-releases/{id_}")
+    def release(self, id_, base_revision=0):
+        # Signed deltas are optional during a rolling upgrade. A missing base or
+        # an active-revision race falls back to the immutable full package.
+        if self.template_public_key and base_revision:
+            r = self.client.get("/api/v3/get/templates/delta", params={"from": base_revision})
+            if r.status_code == 200:
+                if len(r.content) > 32 * 1024**2:
+                    raise ValueError("Template package exceeds size limit")
+                if r.json().get("revision") == id_:
+                    return self._release_response(r, id_)
+            elif r.status_code not in (400, 404, 503):
+                r.raise_for_status()
+        r = self.client.get(f"/internal/v1/template-releases/{id_}", headers={"Accept": "application/vnd.azurpilot.template-bundle+json;version=1"})
+        return self._release_response(r, id_)
+
+    def _release_response(self, r, id_):
         r.raise_for_status()
         if len(r.content) > 32 * 1024**2 or hashlib.sha256(r.content).hexdigest() != r.headers.get("X-Content-SHA256"):
             raise ValueError("Template package checksum/size mismatch")
+        if self.template_public_key:
+            from .template_package import verify_signature
+            verify_signature(r.content, id_, r.headers.get("X-Content-Signature", ""), self.template_public_key)
         return r.json()
 
 

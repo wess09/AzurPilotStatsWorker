@@ -25,8 +25,46 @@ def published_template(encoded):
     if image is None:
         raise ValueError('Invalid published template')
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if image.shape[:2] == (96, 96):
+        # Folder assets use a full item cell; candidate publications use its ROI.
+        image = image[21:70, 40:89].copy()
     image.flags.writeable = False
     return image, cv2.mean(image)[:3]
+
+
+def item_candidate(item, sample_sha256, metadata, file_index, frame_index, slot):
+    import cv2
+    if __package__:
+        from .icons import fingerprint
+        from .commission_rules import parse_amount
+    else:
+        from icons import fingerprint
+        from commission_rules import parse_amount
+    icon = item.image[21:70, 40:89]
+    if icon.shape != (49, 49, 3):
+        raise ValueError("Candidate icon must be 49x49 RGB")
+    pixel_hash, phash = fingerprint(icon)
+    ok, encoded = cv2.imencode(".png", cv2.cvtColor(icon, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise ValueError("Candidate encoding failed")
+    raw = encoded.tobytes()
+    candidate = {
+        "id": hashlib.sha256(raw).hexdigest(),
+        "scene": metadata["project"],
+        "image": base64.b64encode(raw).decode(),
+        "sample_sha256": sample_sha256,
+        "occurrence": f"{file_index}:{frame_index}:{slot}",
+        "metadata": {"file_index": file_index, "frame_index": frame_index, "slot": slot,
+                     "box": [int(v) for v in item._button.area], "server": metadata["server"],
+                     "scene": metadata["scene"],
+                     "icon_sha256": pixel_hash,
+                     "phash": phash, "phash_algorithm": "dct64-gray-area32-v1"},
+    }
+    try:
+        candidate["metadata"]["amount"] = parse_amount(item.amount)
+    except (TypeError, ValueError, OverflowError):
+        pass  # An unreadable quantity must not prevent classifying the icon.
+    return candidate
 
 
 def cache_base_templates(item_grid):
@@ -63,16 +101,24 @@ def research_focus(image, series_list):
     return next((int(s) for s in series_list if s and series_list.count(s) >= 3), 0)
 
 
-def frames(paths, diagnostics):
+def frames(paths, diagnostics, recover=False):
     import numpy as np
     from PIL import Image
     for file_index, path in enumerate(paths):
-        with Image.open(path) as png:
-            if png.format != "PNG" or png.width != 1280 or png.height % 720 or not 1 <= png.height // 720 <= 10:
-                diagnostics.append(f"file:{file_index}:unsupported_resolution")
-                continue
-            for index in range(png.height // 720):
-                yield file_index, index, np.asarray(png.crop((0, index * 720, 1280, (index + 1) * 720)).convert("RGB"))
+        try:
+            with Image.open(path) as png:
+                if png.format != "PNG" or png.width != 1280 or png.height % 720 or not 1 <= png.height // 720 <= 10:
+                    diagnostics.append(f"file:{file_index}:unsupported_resolution")
+                    if recover:
+                        yield file_index, 0, None
+                    continue
+                for index in range(png.height // 720):
+                    yield file_index, index, np.asarray(png.crop((0, index * 720, 1280, (index + 1) * 720)).convert("RGB"))
+        except (OSError, ValueError) as exc:
+            if not recover:
+                raise
+            diagnostics.append(f"file:{file_index}:unreadable_image:{type(exc).__name__}")
+            yield file_index, 0, None
 
 
 def recognize(request):
@@ -140,17 +186,29 @@ def recognize(request):
         else:
             stats.load_template_folder("./assets/stats/battle_items")
         grids = [stats._target_grid()]
-    overlay = {}
+    overlay, temporary = {}, {}
     for t in request["templates"]:
         if not t["enabled"] or t["scene"] not in (meta["project"], "all"):
             continue
         image, color = published_template(t['image'])
         key = t["item_id"] + "_" + str(int(t["id"][:12], 16))
         overlay[key] = t["id"]
+        if t.get("kind") == "temporary":
+            temporary[key] = float(t.get("temporary_similarity", 0.95))
         for grid in grids:
             grid.templates[key] = image
             grid.colors[key] = color
             grid.templates_hit[key] = 0
+    if request.get("match_thresholds") is not None or temporary:
+        if __package__:
+            from .template_package import thresholds
+            from .template_matching import install_priorities
+        else:
+            from template_package import thresholds
+            from template_matching import install_priorities
+        parameters = thresholds(request.get("match_thresholds"))
+        for grid in grids:
+            install_priorities(grid, temporary, parameters["formal"] if not opsi else None)
     used = set()
     def track(match):
         def tracked_match(image, *args, **kwargs):
@@ -161,7 +219,29 @@ def recognize(request):
         return tracked_match
     for grid in grids:
         grid.match_template = track(grid.match_template)
+    def build_candidate(item, file_index, frame_index, slot):
+        return item_candidate(item, source["sha256"], meta, file_index, frame_index, slot)
+    known_icons, overrides = request.get("known_icons", {}), request.get("hash_overrides", {})
+    def acknowledged_cluster(item):
+        if not overrides and not item.name.startswith("U-"):
+            return None
+        pixel_hash = hashlib.sha256(item.image[21:70, 40:89].tobytes()).hexdigest()
+        if pixel_hash in overrides:
+            item.name = overrides[pixel_hash]
+            used.add(pixel_hash)
+            return pixel_hash if item.name.startswith("U-") else None
+        return pixel_hash if item.name.startswith("U-") and known_icons.get(pixel_hash) == item.name else None
+    if not research and meta["scene"].startswith("commission"):
+        if __package__:
+            from .commission import NativeCommissionReader, recognize_commissions
+        else:
+            from commission import NativeCommissionReader, recognize_commissions
+        return recognize_commissions(frames(request["files"], diagnostics, recover=True),
+                                     NativeCommissionReader(stats, meta["server"]), used, diagnostics,
+                                     build_candidate, source_sha256=source["sha256"],
+                                     acknowledged_cluster=acknowledged_cluster)
     candidates = []
+    unresolved = {}
     events = []
     # Repeated reward pages can overlap. The upstream merger identifies the
     # repeated item by name, amount and reward tag within one reward event.
@@ -211,15 +291,27 @@ def recognize(request):
             continue
         reward_frames += 1
         for slot, item in enumerate(found):
-            if not item.is_known_item():
-                icon = item.image[21:70, 40:89]
-                ok, encoded = cv2.imencode(".png", cv2.cvtColor(icon, cv2.COLOR_RGB2BGR))
-                if not ok:
-                    raise ValueError("Candidate encoding failed")
-                raw = encoded.tobytes()
-                id_ = hashlib.sha256(raw).hexdigest()
-                candidates.append({"id": id_, "scene": meta["project"], "image": base64.b64encode(raw).decode(), "sample_sha256": source["sha256"], "occurrence": f"{file_index}:{frame_index}:{slot}", "metadata": {"file_index": file_index, "frame_index": frame_index, "slot": slot, "box": [int(v) for v in item._button.area], "server": meta["server"], "scene": meta["scene"], "amount": int(item.amount)}})
-                diagnostics.append("missing_template:" + id_)
+            registered = acknowledged_cluster(item)
+            if registered:
+                diagnostics.append("unmapped_cluster:" + item.name)
+                if item.amount > 0:
+                    tag = forced_tag or item.tag or ""
+                    unresolved[(file_index, frame_index, slot)] = {"local_key": registered, "tag": tag, "amount": int(item.amount)}
+            elif not item.is_known_item() or item.name.startswith("U-"):
+                candidate = build_candidate(item, file_index, frame_index, slot)
+                candidates.append(candidate)
+                diagnostics.append("missing_template:" + candidate["id"])
+                tag = forced_tag or item.tag or ""
+                candidate["metadata"]["tag"] = tag
+                if item.name.startswith("U-"):
+                    candidate["metadata"]["suspected_key"] = item.name
+                amount = candidate["metadata"].get("amount", 0)
+                if 0 < amount <= 1_000_000_000:
+                    key = (file_index, frame_index, slot) if opsi else (candidate["metadata"]["icon_sha256"], tag, amount)
+                    unresolved[key] = {"local_key": candidate["metadata"]["icon_sha256"],
+                                       "candidate_id": candidate["id"], "tag": tag, "amount": amount}
+                else:
+                    diagnostics.append("invalid_amount:" + candidate["id"])
             elif item.amount <= 0:
                 diagnostics.append("invalid_amount:" + item.name)
             else:
@@ -227,7 +319,7 @@ def recognize(request):
                 key = (file_index, frame_index, slot) if opsi else (item.name, tag, int(item.amount))
                 rewards[key] = {"item": item.name, "tag": tag, "amount": int(item.amount)}
     if meta["scene"] != "research_refresh":
-        if not reward_frames or not rewards:
+        if not reward_frames or not rewards and not unresolved:
             diagnostics.append("no_complete_reward_frame")
         duration = 0
         if research:
@@ -246,6 +338,8 @@ def recognize(request):
                 merged[key]["amount"] += reward["amount"]
         if not research or (series and project):
             event = {"event_type": "complete" if research else "drop", "series": int(series), "project": project, "focus_series": 0, "duration_seconds": duration, "items": sorted(merged.values(), key=lambda x: (x["item"], x["tag"]))}
+            if unresolved:
+                event["unresolved_items"] = list(unresolved.values())
             if opsi:
                 event.update(zone)
             events.append(event)
@@ -258,7 +352,14 @@ def recognize(request):
 def run_request(request_path, output_path):
     try:
         request = json.loads(Path(request_path).read_text(encoding="utf-8"))
-        result = recognize(request)
+        if request.get("operation") == "match_icons":
+            if __package__:
+                from .icons import match_icons
+            else:
+                from icons import match_icons
+            result = match_icons(request)
+        else:
+            result = recognize(request)
     except Exception:
         result = {"events": [], "diagnostics": [traceback.format_exc()[-2000:]], "candidates": [], "used_templates": [], "status": "needs_review"}
     destination = Path(output_path)

@@ -24,21 +24,25 @@ def template_fields(template):
     image = template.get('image') or ''
     if isinstance(image, str) and len(image) > 200:
         image = hashlib.sha256(image.encode()).hexdigest()
-    return (template.get('item_id'), template.get('scene'), template.get('enabled'), image)
+    return (template.get('item_id'), template.get('scene'), template.get('enabled'), image,
+            template.get('kind'), template.get('match_thresholds'))
 
 
-def template_snapshot(templates):
+def template_snapshot(templates, options=None):
     snapshot = []
     for template in templates:
-        item = {key: template.get(key) for key in ('item_id', 'scene', 'enabled')}
+        item = {key: template.get(key) for key in ('item_id', 'scene', 'enabled', 'kind', 'match_thresholds')}
         item['id'] = template['id']
         item['image'] = template_fields(template)[3]
         snapshot.append(item)
+    for pixel_hash, item in (options or {}).get('hash_overrides', {}).items():
+        snapshot.append({'id': pixel_hash, 'item_id': item, 'scene': 'all', 'enabled': True,
+                         'image': '', 'kind': 'hash_override', 'match_thresholds': None})
     return snapshot
 
 
 def needs_template_retry(result, previous, current):
-    if result.get('candidate_ids') or any(d == 'missing_template' or d.startswith('missing_template:')
+    if result.get('candidate_ids') or any(d == 'missing_template' or d.startswith(('missing_template:', 'unmapped_cluster:'))
                                           for d in result.get('diagnostics', [])):
         return True
     used = result.get('used_templates', [])
@@ -53,6 +57,17 @@ def needs_template_retry(result, previous, current):
 
 
 class Engine:
+    def match_icons(self, body):
+        """Bounded stateless work in the existing native process environment."""
+        with tempfile.TemporaryDirectory(prefix="icons-", dir=self.work) as directory:
+            request, output = Path(directory) / "request.json", Path(directory) / "result.json"
+            request.write_text(json.dumps({**body, "operation": "match_icons", "alas_root": str(self.config.alas_root)}), encoding="utf-8")
+            self.recognizers.recognize(request, output, "cn", timeout=60)
+            result = json.loads(output.read_text(encoding="utf-8"))
+            if "results" not in result:
+                raise ValueError("Icon matching failed")
+            return result
+
     def __init__(self, config, db):
         self.config = config
         self.db = db
@@ -241,11 +256,15 @@ class Engine:
 
     def stage_recognize(self, job):
         source = self.source(job)
-        release_id, templates = self.db.release()
+        release_id, templates, options = self.db.release_snapshot()
         request = {"source": source, "files": [str(path) for path in self.files(job)],
-                   "alas_root": str(self.config.alas_root), "templates": templates}
+                   "alas_root": str(self.config.alas_root), "templates": templates,
+                   **options}
         try:
             parsed, elapsed = self.run_recognizer(request, job, 'recognize')
+            if parsed.get("skipped_frames"):
+                log.warning("Commission frames skipped sha=%s details=%s", source["sha256"],
+                            json.dumps(parsed["skipped_frames"], ensure_ascii=False))
             if ({"no_complete_reward_frame", "unknown_research_project_or_series"}
                     <= set(parsed["diagnostics"]) and self.db.is_redundant_research_list(source)):
                 parsed = {"status": "invalid", "events": [], "diagnostics": ["duplicate_research_list_capture"],
@@ -258,13 +277,13 @@ class Engine:
             # Revision 0 is a local, durable "not allocated yet" marker.
             revision = 0
             result = {"sha256": source["sha256"], "revision": revision, "status": parsed["status"],
-                      "parser_version": "azurpilot-adapter-v2",
+                      "parser_version": "azurpilot-adapter-v4",
                       "template_release": release_id, "source": source,
                       "events": parsed["events"], "diagnostics": parsed["diagnostics"],
                       "candidate_ids": sorted({c["id"] for c in parsed["candidates"]}),
                       "used_templates": parsed["used_templates"]}
             self.db.timed(job, 'ocr_ms', elapsed * 1000)
-            self.db.save_result(job, result, parsed["candidates"], template_snapshot(templates))
+            self.db.save_result(job, result, parsed["candidates"], template_snapshot(templates, options))
             self.cleanup(job)
             # Hand the lease to the delivery stage; it is a separate worker.
             self.db.advance(job, 'delivery')
@@ -276,16 +295,27 @@ class Engine:
             return self.fail(job, 'pending', 'recognize', error)
 
     def deliver(self, job, source, result, candidates, snapshot):
+        references = []
         for candidate in candidates:
-            self.stats.post("/internal/v1/template-candidates", candidate)
+            receipt = self.stats.post("/internal/v1/template-candidates", candidate)
+            self.db.cache_icon(candidate, receipt)
+            if receipt.get("need_screenshot") and receipt.get("key"):
+                references.append({"key": receipt["key"], "candidate_id": candidate["id"],
+                                   "sample_sha256": source["sha256"],
+                                   "file_index": candidate["metadata"]["file_index"],
+                                   "frame_index": candidate["metadata"]["frame_index"]})
         ack = self.stats.post("/internal/v1/statistics/results", {"results": [result]})["receipts"][0]
         if ack["status"] in ("accepted", "duplicate"):
+            for reference in references:
+                # Originals are already on 123Pan. Register a bounded preview
+                # reference after C knows the source, without duplicating bytes.
+                self.stats.post("/internal/v1/unknown-screenshots", reference)
             self.db.finish(job)
             self.cleanup(job)
             log.info('stage=deliver sha=%s job=%s revision=%s status=%s receipt=%s',
                      source["sha256"], job['id'], result["revision"], result["status"], ack["status"])
-            active, current_templates = self.db.release()
-            if active != result["template_release"] and needs_template_retry(result, snapshot, current_templates):
+            active, current_templates, current_options = self.db.release_snapshot()
+            if active != result["template_release"] and needs_template_retry(result, snapshot, template_snapshot(current_templates, current_options)):
                 # Publication may race an in-flight first result, before C
                 # knows that source. It must not miss the new template pass.
                 self.db.enqueue_release(source, active)
@@ -318,7 +348,7 @@ class Engine:
                 self.db.update_reprocess_command(int(job["task"].split(":")[1]))
 
     # ---- compatibility: single-shot recognition for template tests ------
-    def recognize(self, source, templates=None):
+    def recognize(self, source, templates=None, recognition_options=None):
         with tempfile.TemporaryDirectory(dir=self.work) as temporary:
             directory = Path(temporary)
             paths = []
@@ -327,7 +357,8 @@ class Engine:
                 self.pan.download(file, path)
                 paths.append(str(path))
             request = {"source": source, "files": paths, "alas_root": str(self.config.alas_root),
-                       "templates": self.db.setting("templates", []) if templates is None else templates}
+                       "templates": self.db.setting("templates", []) if templates is None else templates,
+                       **(recognition_options or {})}
             input_path = directory / "input.json"
             output_path = directory / "output.json"
             input_path.write_text(json.dumps(request), encoding="utf-8")
@@ -348,8 +379,12 @@ class Engine:
             snapshot = json.loads(job["snapshot"]) if job.get("snapshot") else None
             if job["state"] != "delivery":
                 revision = self.stats.revision(source["sha256"]) + 1
-                release_id, templates = self.db.release()
-                parsed = self.recognize(source, templates)
+                release_id, templates, options = self.db.release_snapshot()
+                parsed = (self.recognize(source, templates, recognition_options=options) if any(options.values())
+                          else self.recognize(source, templates))
+                if parsed.get("skipped_frames"):
+                    log.warning("Commission frames skipped sha=%s details=%s", source["sha256"],
+                                json.dumps(parsed["skipped_frames"], ensure_ascii=False))
                 if ({"no_complete_reward_frame", "unknown_research_project_or_series"}
                         <= set(parsed["diagnostics"]) and self.db.is_redundant_research_list(source)):
                     parsed = {"status": "invalid", "events": [], "diagnostics": ["duplicate_research_list_capture"],
@@ -359,11 +394,11 @@ class Engine:
                     raise ValueError("Invalid inferred metadata")
                 source["metadata"].update(overrides)
                 result = {"sha256": source["sha256"], "revision": revision, "status": parsed["status"],
-                          "parser_version": "azurpilot-adapter-v2", "template_release": release_id,
+                          "parser_version": "azurpilot-adapter-v4", "template_release": release_id,
                           "source": source, "events": parsed["events"], "diagnostics": parsed["diagnostics"],
                           "candidate_ids": sorted({c["id"] for c in parsed["candidates"]}),
                           "used_templates": parsed["used_templates"]}
-                snapshot = template_snapshot(templates)
+                snapshot = template_snapshot(templates, options)
                 self.db.save_result(job, result, parsed["candidates"], snapshot)
                 candidates = parsed["candidates"]
             else:
@@ -384,7 +419,9 @@ class Engine:
                                                              "pending": self.db.pending(), "updates": updates})
         release = reply.get("release_id") or 0
         if release != self.db.setting("release_id", 0):
-            templates = self.stats.release(release) if release else []
+            base = self.db.setting("template_bundle")
+            templates = (self.stats.release(release, base["revision"]) if base and self.config.template_public_key
+                         else self.stats.release(release)) if release else []
             # Atomic snapshot: no task can observe half a package.
             self.db.set_release(release, templates)
         self.db.accept_commands(reply["commands"], updates)

@@ -39,6 +39,34 @@ def create_app(config=None, start_engine=True):
             db.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+    icon_slots = asyncio.Semaphore(2)
+
+    @app.post("/internal/v1/icon-matches")
+    async def icon_matches(request: Request):
+        import json
+        from fastapi import HTTPException
+        if not config.worker_token or not hmac.compare_digest(
+                request.headers.get("authorization", ""), "Bearer " + config.worker_token):
+            raise HTTPException(401)
+        raw = bytearray()
+        async for part in request.stream():
+            raw.extend(part)
+            if len(raw) > 32 * 1024 * 1024:
+                raise HTTPException(413, "Icon request exceeds 32 MiB")
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict) or not isinstance(body.get("icons"), list) or not 1 <= len(body["icons"]) <= 50:
+                raise ValueError("Expected 1..50 icons")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, "Invalid icon matching request") from exc
+        engine = request.app.state.engine
+        if engine is None:
+            raise HTTPException(503)
+        async with icon_slots:
+            try:
+                return await asyncio.to_thread(engine.match_icons, body)
+            except ValueError as exc:
+                raise HTTPException(400, "Invalid icon matching data") from exc
 
     @app.post("/internal/v1/preview")
     def preview(body: dict, request: Request):

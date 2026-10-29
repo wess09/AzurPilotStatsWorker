@@ -190,19 +190,76 @@ class Database:
     def set_setting(self, key, value):
         with self.lock, self.db:
             self.db.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
-            if key in ('release_id', 'templates'):
+            if key in ('release_id', 'templates', 'local_icons', 'template_bundle'):
                 self._release_cache = None
 
     def release(self):
         with self.lock:
             if self._release_cache is None:
-                self._release_cache = self.setting("release_id", 0), self.setting("templates", [])
-            return self._release_cache
+                bundle = self.setting("template_bundle")
+                published = self.setting("templates", [])
+                by_id = {entry["id"]: entry for entry in self.setting("local_icons", [])}
+                by_id.update({entry["id"]: entry for entry in published})
+                entries = list(by_id.values())
+                options = {"match_thresholds": bundle["match_thresholds"],
+                           "hash_overrides": {pixel_hash: bundle["mappings"].get(key, key)
+                                              for pixel_hash, key in bundle.get("hash_overrides", {}).items()}} if bundle else {}
+                options["known_icons"] = {entry["known_icon_sha256"]: entry["item_id"] for entry in entries
+                                           if entry.get("known_icon_sha256")}
+                self._release_cache = self.setting("release_id", 0), entries, options
+            return self._release_cache[:2]
 
     def set_release(self, id_, templates):
         with self.lock, self.db:
-            for key, value in (("release_id", id_), ("templates", templates)):
+            current = self.setting("release_id", 0)
+            if type(id_) is not int or id_ < current:
+                raise ValueError("Template revision cannot move backwards")
+            bundle = None
+            if isinstance(templates, dict):
+                from .template_package import normalize_bundle, effective_templates
+                bundle = normalize_bundle(templates, id_, self.setting("template_bundle"))
+                if id_ == current and bundle != self.setting("template_bundle"):
+                    raise ValueError("Template revision is immutable")
+                templates = effective_templates(bundle)
+            elif not isinstance(templates, list):
+                raise ValueError("Invalid template release")
+            for key, value in (("release_id", id_), ("templates", templates), ("template_bundle", bundle)):
                 self.db.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
+            if id_ > current:
+                self.db.execute("DELETE FROM settings WHERE key='local_icons'")
+            self._release_cache = None
+
+    def release_snapshot(self):
+        with self.lock:
+            self.release()
+            return self._release_cache
+
+    def cache_icon(self, candidate, receipt):
+        from .template_package import ITEM, CLUSTER
+        kind = receipt.get("match")
+        item = receipt.get("item") if kind == "formal" else receipt.get("key")
+        if kind not in ("formal", "cluster", "new"):
+            return
+        pixel_hash = candidate.get("metadata", {}).get("icon_sha256")
+        if pixel_hash is None:
+            return  # A durable candidate produced by an older parser.
+        if receipt.get("local_key") != pixel_hash or not isinstance(item, str) or not ITEM.fullmatch(item):
+            raise ValueError("Invalid icon acknowledgment")
+        if (kind != "formal" and not CLUSTER.fullmatch(item)) or (kind == "formal" and CLUSTER.fullmatch(item)):
+            raise ValueError("Invalid server cluster key")
+        revision = receipt.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise ValueError("Invalid icon acknowledgment revision")
+        with self.lock, self.db:
+            if revision != self.setting("release_id", 0):
+                return
+            cached = [entry for entry in self.setting("local_icons", []) if entry["id"] != candidate["id"]]
+            cached.append({"id": candidate["id"], "item_id": item, "image": candidate["image"],
+                           "scene": "all", "enabled": True,
+                           "kind": "formal" if kind == "formal" else "temporary",
+                           "known_icon_sha256": pixel_hash, "temporary_similarity": 0.95})
+            self.db.execute("INSERT INTO settings VALUES('local_icons',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (json.dumps(cached[-512:]),))
             self._release_cache = None
 
     def update_reprocess_command(self, id_):
